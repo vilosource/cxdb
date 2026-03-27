@@ -11,8 +11,8 @@ use anyhow::{Context, Result};
 use cli::Cli;
 use delivery::DeliveryHandle;
 use ledger::SessionLedgerWriter;
-use provider::ProviderKind;
-use proxy::ProxyServer;
+use provider::{resolve_upstream_base_for_env, ProviderKind};
+use proxy::{ProxyServer, UpstreamConfig};
 use session::SessionRuntime;
 use std::process::Stdio;
 use tokio::process::Command;
@@ -25,10 +25,36 @@ pub async fn run(cli: Cli) -> Result<i32> {
         .parse()
         .with_context(|| format!("invalid CXDB URL: {effective_url}"))?;
 
-    let upstream = provider
-        .resolve_upstream_base()
-        .context("failed to resolve provider upstream base URL")?;
-    let (listener, proxy_base_url) = ProxyServer::bind(provider, &upstream)
+    let upstream_config = match provider {
+        ProviderKind::Pi => {
+            let openai_upstream = resolve_upstream_base_for_env(
+                &["OPENAI_BASE_URL", "OPENAI_API_BASE"],
+                "https://api.openai.com/v1",
+            )
+            .context("failed to resolve OpenAI upstream for Pi")?;
+            let anthropic_upstream = resolve_upstream_base_for_env(
+                &[
+                    "ANTHROPIC_BASE_URL",
+                    "ANTHROPIC_API_URL",
+                    "ANTHROPIC_API_BASE",
+                ],
+                "https://api.anthropic.com",
+            )
+            .context("failed to resolve Anthropic upstream for Pi")?;
+            UpstreamConfig::DualProtocol {
+                openai_upstream,
+                anthropic_upstream,
+            }
+        }
+        _ => {
+            let upstream_base = provider
+                .resolve_upstream_base()
+                .context("failed to resolve provider upstream base URL")?;
+            UpstreamConfig::Single { upstream_base }
+        }
+    };
+
+    let (listener, proxy_base_url) = ProxyServer::bind(provider, &upstream_config)
         .await
         .context("failed to reserve local reverse proxy listener")?;
     let args = provider.child_args_for_proxy(cli.command.args(), Some(&proxy_base_url));
@@ -38,7 +64,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
 
     let proxy = ProxyServer::start_with_listener(
         provider,
-        upstream,
+        upstream_config,
         session.clone(),
         ledger.clone(),
         listener,

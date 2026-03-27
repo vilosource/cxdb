@@ -531,7 +531,9 @@ async fn websocket_proxy_uploads_canonical_turns_into_cxdb() {
     let ledger = SessionLedgerWriter::create(&session).await.unwrap();
     let proxy = cxtx::proxy::ProxyServer::start(
         ProviderKind::Codex,
-        upstream.base_url.parse().unwrap(),
+        cxtx::proxy::UpstreamConfig::Single {
+            upstream_base: upstream.base_url.parse().unwrap(),
+        },
         session.clone(),
         ledger.clone(),
     )

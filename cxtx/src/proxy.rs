@@ -22,18 +22,94 @@ use url::Url;
 
 use crate::delivery::DeliveryHandle;
 use crate::ledger::SessionLedgerWriter;
-use crate::provider::{anthropic, openai, PreparedExchange, ProviderKind};
+use crate::provider::{openai, PreparedExchange, ProtocolKind, ProviderKind};
 use crate::session::SessionRuntime;
 use crate::turns::ArtifactRefs;
+
+/// Upstream routing configuration. Single-protocol for Codex/Claude, dual-protocol for Pi.
+#[derive(Clone, Debug)]
+pub enum UpstreamConfig {
+    Single {
+        upstream_base: Url,
+    },
+    DualProtocol {
+        openai_upstream: Url,
+        anthropic_upstream: Url,
+    },
+}
+
+/// Per-request routing result resolved from the incoming URI and upstream config.
+struct ResolvedRoute {
+    protocol: ProtocolKind,
+    upstream_url: Url,
+}
 
 #[derive(Clone)]
 struct ProxyState {
     provider: ProviderKind,
-    upstream_base: Url,
+    upstream: UpstreamConfig,
     client: reqwest::Client,
     session: SessionRuntime,
     ledger: SessionLedgerWriter,
     delivery: Arc<RwLock<Option<DeliveryHandle>>>,
+}
+
+impl ProxyState {
+    fn resolve_route(&self, uri: &http::Uri) -> Result<ResolvedRoute> {
+        match &self.upstream {
+            UpstreamConfig::Single { upstream_base } => {
+                let url = self
+                    .provider
+                    .build_upstream_url(upstream_base, uri)
+                    .context("failed to derive upstream URL")?;
+                let protocol = match self.provider {
+                    ProviderKind::Codex => ProtocolKind::OpenAi,
+                    ProviderKind::Claude => ProtocolKind::Anthropic,
+                    ProviderKind::Pi => unreachable!("Pi always uses DualProtocol"),
+                };
+                Ok(ResolvedRoute {
+                    protocol,
+                    upstream_url: url,
+                })
+            }
+            UpstreamConfig::DualProtocol {
+                openai_upstream,
+                anthropic_upstream,
+            } => {
+                let path = uri.path();
+                if let Some(suffix) = path.strip_prefix("/openai") {
+                    let suffix = if suffix.is_empty() { "/" } else { suffix };
+                    let url = rebase_url(openai_upstream, suffix, uri.query())?;
+                    Ok(ResolvedRoute {
+                        protocol: ProtocolKind::OpenAi,
+                        upstream_url: url,
+                    })
+                } else if let Some(suffix) = path.strip_prefix("/anthropic") {
+                    let suffix = if suffix.is_empty() { "/" } else { suffix };
+                    let url = rebase_url(anthropic_upstream, suffix, uri.query())?;
+                    Ok(ResolvedRoute {
+                        protocol: ProtocolKind::Anthropic,
+                        upstream_url: url,
+                    })
+                } else {
+                    Err(anyhow!(
+                        "request path {path} does not match /openai/ or /anthropic/ prefix"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Build an upstream URL by setting the path on the upstream's origin (scheme + host + port).
+/// Unlike `join_url` which appends to the base path, this replaces the path entirely.
+/// Used for dual-protocol routing where the proxy prefix is stripped and the suffix
+/// becomes the full upstream path.
+fn rebase_url(upstream: &Url, path: &str, query: Option<&str>) -> Result<Url> {
+    let mut url = upstream.clone();
+    url.set_path(path);
+    url.set_query(query);
+    Ok(url)
 }
 
 pub struct ProxyServer {
@@ -44,27 +120,30 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
-    pub async fn bind(provider: ProviderKind, upstream_base: &Url) -> Result<(TcpListener, Url)> {
+    pub async fn bind(
+        provider: ProviderKind,
+        upstream: &UpstreamConfig,
+    ) -> Result<(TcpListener, Url)> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .context("failed to bind proxy listener")?;
         let addr = listener
             .local_addr()
             .context("missing proxy listener address")?;
-        let proxy_base_url = proxy_base_url(provider, upstream_base, addr)?;
+        let proxy_base_url = compute_proxy_base_url(provider, upstream, addr)?;
         Ok((listener, proxy_base_url))
     }
 
     pub async fn start(
         provider: ProviderKind,
-        upstream_base: Url,
+        upstream: UpstreamConfig,
         session: SessionRuntime,
         ledger: SessionLedgerWriter,
     ) -> Result<Self> {
-        let (listener, proxy_base_url) = Self::bind(provider, &upstream_base).await?;
+        let (listener, proxy_base_url) = Self::bind(provider, &upstream).await?;
         Self::start_with_listener(
             provider,
-            upstream_base,
+            upstream,
             session,
             ledger,
             listener,
@@ -75,7 +154,7 @@ impl ProxyServer {
 
     pub async fn start_with_listener(
         provider: ProviderKind,
-        upstream_base: Url,
+        upstream: UpstreamConfig,
         session: SessionRuntime,
         ledger: SessionLedgerWriter,
         listener: TcpListener,
@@ -86,7 +165,7 @@ impl ProxyServer {
             .context("failed to construct proxy reqwest client")?;
         let state = ProxyState {
             provider,
-            upstream_base,
+            upstream,
             client,
             session,
             ledger,
@@ -160,9 +239,8 @@ async fn handle_proxy_request(state: ProxyState, request: Request<Body>) -> Resu
     let body_bytes = to_bytes(body, usize::MAX)
         .await
         .context("failed to read downstream request body")?;
-    let upstream_url = state
-        .provider
-        .build_upstream_url(&state.upstream_base, &parts.uri)
+    let route = state
+        .resolve_route(&parts.uri)
         .context("failed to derive upstream URL")?;
     let request_headers = forwardable_headers(&parts.headers);
     let request_content_type = header_value(&parts.headers, "content-type");
@@ -187,7 +265,7 @@ async fn handle_proxy_request(state: ProxyState, request: Request<Body>) -> Resu
         )
         .await?;
     let artifact_refs = ArtifactRefs::default().with_request_path(Some(request_artifact));
-    let prepared = state.provider.prepare_exchange(
+    let prepared = route.protocol.prepare_exchange(
         &state.session,
         exchange_id.clone(),
         &body_bytes,
@@ -195,7 +273,7 @@ async fn handle_proxy_request(state: ProxyState, request: Request<Body>) -> Resu
     );
     enqueue_turns(&delivery, prepared.request_turns.clone()).await;
 
-    let mut upstream_request = state.client.request(parts.method.clone(), upstream_url);
+    let mut upstream_request = state.client.request(parts.method.clone(), route.upstream_url);
     upstream_request = upstream_request.body(body_bytes.to_vec());
     for (name, value) in request_headers {
         upstream_request = upstream_request.header(name, value);
@@ -268,12 +346,10 @@ async fn handle_websocket_proxy_request(
     let ws = WebSocketUpgrade::from_request_parts(&mut parts, &())
         .await
         .map_err(|err| anyhow!("invalid websocket upgrade request: {err}"))?;
-    let upstream_url = websocket_upstream_url(
-        &state
-            .provider
-            .build_upstream_url(&state.upstream_base, &parts.uri)
-            .context("failed to derive upstream websocket URL")?,
-    )?;
+    let route = state
+        .resolve_route(&parts.uri)
+        .context("failed to derive upstream websocket URL")?;
+    let upstream_url = websocket_upstream_url(&route.upstream_url)?;
     let request_headers = websocket_forwardable_headers(&parts.headers);
 
     let exchange_id = state.session.next_exchange_id();
@@ -422,7 +498,6 @@ async fn stream_response(
     prepared: PreparedExchange,
     artifact_refs: ArtifactRefs,
 ) -> Result<Response<Body>> {
-    let provider = state.provider;
     let session = state.session.clone();
     let ledger = state.ledger.clone();
     let exchange_id = prepared.exchange_id.clone();
@@ -442,10 +517,7 @@ async fn stream_response(
                     let text = String::from_utf8_lossy(&chunk);
                     raw_stream.push_str(&text);
                     parse_buffer.push_str(&text);
-                    let frames = match provider {
-                        ProviderKind::Codex => openai::parse_sse_buffer(&mut parse_buffer),
-                        ProviderKind::Claude => anthropic::parse_sse_buffer(&mut parse_buffer),
-                    };
+                    let frames = openai::parse_sse_buffer(&mut parse_buffer);
                     for frame in frames {
                         match ledger.append_stream_frame(&exchange_id, &frame.raw).await {
                             Ok(path) => {
@@ -655,10 +727,21 @@ async fn relay_websocket(
     Ok(())
 }
 
-fn proxy_base_url(provider: ProviderKind, upstream_base: &Url, addr: SocketAddr) -> Result<Url> {
+fn compute_proxy_base_url(
+    provider: ProviderKind,
+    upstream: &UpstreamConfig,
+    addr: SocketAddr,
+) -> Result<Url> {
     let mut url = Url::parse(&format!("http://{addr}")).context("failed to build proxy URL")?;
-    let mount_path = provider.proxy_mount_path(upstream_base);
-    url.set_path(&mount_path);
+    match upstream {
+        UpstreamConfig::Single { upstream_base } => {
+            let mount_path = provider.proxy_mount_path(upstream_base);
+            url.set_path(&mount_path);
+        }
+        UpstreamConfig::DualProtocol { .. } => {
+            // Pi: proxy base is the root; path prefixes (/openai/, /anthropic/) are per-request
+        }
+    }
     Ok(url)
 }
 
@@ -1023,7 +1106,8 @@ fn is_hop_by_hop(name: &str) -> bool {
 mod tests {
     use super::{
         forwardable_headers, is_benign_websocket_read_error, is_websocket_upgrade_request,
-        websocket_forwardable_headers, websocket_upstream_url, ProxyServer, WebsocketCapture,
+        websocket_forwardable_headers, websocket_upstream_url, ProxyServer, ProxyState,
+        UpstreamConfig, WebsocketCapture,
     };
     use axum::body::Body;
     use axum::http::{HeaderMap, HeaderValue};
@@ -1032,6 +1116,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
+    use tokio::sync::RwLock;
     use tokio_tungstenite::tungstenite::error::ProtocolError as TungsteniteProtocolError;
     use tokio_tungstenite::tungstenite::handshake::server::{
         Request as WsRequest, Response as WsResponse,
@@ -1134,7 +1219,9 @@ mod tests {
         let ledger = SessionLedgerWriter::create(&session).await.unwrap();
         let proxy = ProxyServer::start(
             ProviderKind::Codex,
-            Url::parse(&format!("ws://{upstream_addr}/v1")).unwrap(),
+            UpstreamConfig::Single {
+                upstream_base: Url::parse(&format!("ws://{upstream_addr}/v1")).unwrap(),
+            },
             session,
             ledger.clone(),
         )
@@ -1258,5 +1345,128 @@ mod tests {
         assert!(is_benign_websocket_read_error(
             &TungsteniteError::ConnectionClosed
         ));
+    }
+
+    #[tokio::test]
+    async fn dual_protocol_routes_openai_prefix_to_openai_upstream() {
+        use crate::provider::ProtocolKind;
+
+        let session =
+            SessionRuntime::new(ProviderKind::Pi, Vec::new(), BTreeMap::new()).unwrap();
+        let state = ProxyState {
+            provider: ProviderKind::Pi,
+            upstream: UpstreamConfig::DualProtocol {
+                openai_upstream: Url::parse("https://api.openai.com/v1").unwrap(),
+                anthropic_upstream: Url::parse("https://api.anthropic.com").unwrap(),
+            },
+            client: reqwest::Client::new(),
+            session: session.clone(),
+            ledger: SessionLedgerWriter::create(&session).await.unwrap(),
+            delivery: Arc::new(RwLock::new(None)),
+        };
+
+        let uri: http::Uri = "/openai/v1/chat/completions?stream=true"
+            .parse()
+            .unwrap();
+        let route = state.resolve_route(&uri).unwrap();
+        assert_eq!(route.protocol, ProtocolKind::OpenAi);
+        assert_eq!(
+            route.upstream_url.as_str(),
+            "https://api.openai.com/v1/chat/completions?stream=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_protocol_routes_anthropic_prefix_to_anthropic_upstream() {
+        use crate::provider::ProtocolKind;
+
+        let session =
+            SessionRuntime::new(ProviderKind::Pi, Vec::new(), BTreeMap::new()).unwrap();
+        let state = ProxyState {
+            provider: ProviderKind::Pi,
+            upstream: UpstreamConfig::DualProtocol {
+                openai_upstream: Url::parse("https://api.openai.com/v1").unwrap(),
+                anthropic_upstream: Url::parse("https://api.anthropic.com").unwrap(),
+            },
+            client: reqwest::Client::new(),
+            session: session.clone(),
+            ledger: SessionLedgerWriter::create(&session).await.unwrap(),
+            delivery: Arc::new(RwLock::new(None)),
+        };
+
+        let uri: http::Uri = "/anthropic/v1/messages".parse().unwrap();
+        let route = state.resolve_route(&uri).unwrap();
+        assert_eq!(route.protocol, ProtocolKind::Anthropic);
+        assert_eq!(
+            route.upstream_url.as_str(),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_protocol_rejects_unknown_prefix() {
+        let session =
+            SessionRuntime::new(ProviderKind::Pi, Vec::new(), BTreeMap::new()).unwrap();
+        let state = ProxyState {
+            provider: ProviderKind::Pi,
+            upstream: UpstreamConfig::DualProtocol {
+                openai_upstream: Url::parse("https://api.openai.com/v1").unwrap(),
+                anthropic_upstream: Url::parse("https://api.anthropic.com").unwrap(),
+            },
+            client: reqwest::Client::new(),
+            session: session.clone(),
+            ledger: SessionLedgerWriter::create(&session).await.unwrap(),
+            delivery: Arc::new(RwLock::new(None)),
+        };
+
+        let uri: http::Uri = "/google/v1/generate".parse().unwrap();
+        assert!(state.resolve_route(&uri).is_err());
+    }
+
+    #[tokio::test]
+    async fn single_protocol_routes_through_provider() {
+        use crate::provider::ProtocolKind;
+
+        let session =
+            SessionRuntime::new(ProviderKind::Codex, Vec::new(), BTreeMap::new()).unwrap();
+        let state = ProxyState {
+            provider: ProviderKind::Codex,
+            upstream: UpstreamConfig::Single {
+                upstream_base: Url::parse("https://api.openai.com/v1").unwrap(),
+            },
+            client: reqwest::Client::new(),
+            session: session.clone(),
+            ledger: SessionLedgerWriter::create(&session).await.unwrap(),
+            delivery: Arc::new(RwLock::new(None)),
+        };
+
+        let uri: http::Uri = "/v1/chat/completions".parse().unwrap();
+        let route = state.resolve_route(&uri).unwrap();
+        assert_eq!(route.protocol, ProtocolKind::OpenAi);
+        assert_eq!(
+            route.upstream_url.as_str(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn compute_proxy_base_url_dual_protocol_has_no_path() {
+        let upstream = UpstreamConfig::DualProtocol {
+            openai_upstream: Url::parse("https://api.openai.com/v1").unwrap(),
+            anthropic_upstream: Url::parse("https://api.anthropic.com").unwrap(),
+        };
+        let addr: std::net::SocketAddr = "127.0.0.1:48123".parse().unwrap();
+        let url = super::compute_proxy_base_url(ProviderKind::Pi, &upstream, addr).unwrap();
+        assert_eq!(url.as_str(), "http://127.0.0.1:48123/");
+    }
+
+    #[test]
+    fn compute_proxy_base_url_single_protocol_preserves_mount_path() {
+        let upstream = UpstreamConfig::Single {
+            upstream_base: Url::parse("https://api.openai.com/v1").unwrap(),
+        };
+        let addr: std::net::SocketAddr = "127.0.0.1:48123".parse().unwrap();
+        let url = super::compute_proxy_base_url(ProviderKind::Codex, &upstream, addr).unwrap();
+        assert_eq!(url.as_str(), "http://127.0.0.1:48123/v1");
     }
 }

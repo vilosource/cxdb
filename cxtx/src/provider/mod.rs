@@ -15,6 +15,14 @@ use crate::turns::{ArtifactRefs, TurnEnvelope};
 pub enum ProviderKind {
     Codex,
     Claude,
+    Pi,
+}
+
+/// Wire protocol detected per-request inside the proxy (used for Pi's dual-protocol routing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolKind {
+    OpenAi,
+    Anthropic,
 }
 
 #[derive(Debug)]
@@ -36,6 +44,7 @@ impl ProviderKind {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Pi => "pi",
         }
     }
 
@@ -43,6 +52,7 @@ impl ProviderKind {
         match self {
             Self::Codex => "openai",
             Self::Claude => "anthropic",
+            Self::Pi => "pi",
         }
     }
 
@@ -50,6 +60,7 @@ impl ProviderKind {
         match self {
             Self::Codex => "cxtx/codex",
             Self::Claude => "cxtx/claude",
+            Self::Pi => "cxtx/pi",
         }
     }
 
@@ -83,7 +94,7 @@ impl ProviderKind {
                 out.extend(args.iter().cloned());
                 out
             }
-            Self::Claude => args.to_vec(),
+            Self::Claude | Self::Pi => args.to_vec(),
         }
     }
 
@@ -93,12 +104,15 @@ impl ProviderKind {
             match self {
                 Self::Codex => "codex",
                 Self::Claude => "claude",
+                Self::Pi => "pi",
             }
             .to_string(),
             "interactive".to_string(),
         ]
     }
 
+    /// Resolve the single upstream base URL from environment variables.
+    /// For Pi, use `resolve_upstream_base_for_env` per protocol instead.
     pub fn resolve_upstream_base(self) -> Result<Url> {
         let env_names = self.upstream_base_env_names();
         let value = env_names
@@ -107,6 +121,11 @@ impl ProviderKind {
         let default = match self {
             Self::Codex => "https://api.openai.com/v1",
             Self::Claude => "https://api.anthropic.com",
+            Self::Pi => {
+                return Err(anyhow!(
+                    "Pi uses dual-protocol upstreams; use resolve_upstream_base_for_env instead"
+                ))
+            }
         };
         let parsed = Url::parse(value.as_deref().unwrap_or(default)).with_context(|| {
             format!(
@@ -164,13 +183,25 @@ impl ProviderKind {
                     ("CLAUDE_CODE_BASE_URL".to_string(), root),
                 ]
             }
+            Self::Pi => {
+                let root = proxy_base_url.origin().unicode_serialization();
+                let openai_base = format!("{root}/openai/v1");
+                let anthropic_base = format!("{root}/anthropic");
+                vec![
+                    ("OPENAI_BASE_URL".to_string(), openai_base.clone()),
+                    ("OPENAI_API_BASE".to_string(), openai_base),
+                    ("ANTHROPIC_BASE_URL".to_string(), anthropic_base.clone()),
+                    ("ANTHROPIC_API_URL".to_string(), anthropic_base.clone()),
+                    ("ANTHROPIC_API_BASE".to_string(), anthropic_base),
+                ]
+            }
         }
     }
 
     pub fn proxy_mount_path(self, upstream_base: &Url) -> String {
         match self {
             Self::Codex => normalize_path(upstream_base.path()),
-            Self::Claude => "/".to_string(),
+            Self::Claude | Self::Pi => "/".to_string(),
         }
     }
 
@@ -182,6 +213,11 @@ impl ProviderKind {
                 anyhow!("request path {path} does not match proxy mount {mount_path}")
             })?,
             Self::Claude => path.to_string(),
+            Self::Pi => {
+                return Err(anyhow!(
+                    "Pi uses dual-protocol routing; build_upstream_url should not be called directly"
+                ))
+            }
         };
 
         join_url(upstream_base, &relative_path, uri.query())
@@ -191,6 +227,11 @@ impl ProviderKind {
         let names: &[&str] = match self {
             Self::Codex => &["x-request-id", "request-id"],
             Self::Claude => &["request-id", "anthropic-request-id", "x-request-id"],
+            Self::Pi => &[
+                "x-request-id",
+                "request-id",
+                "anthropic-request-id",
+            ],
         };
         names.iter().find_map(|name| {
             headers
@@ -224,6 +265,17 @@ impl ProviderKind {
                 "user-agent",
                 "x-request-id",
             ],
+            Self::Pi => &[
+                "accept",
+                "anthropic-version",
+                "anthropic-request-id",
+                "content-length",
+                "content-type",
+                "openai-processing-ms",
+                "request-id",
+                "user-agent",
+                "x-request-id",
+            ],
         };
 
         let mut out = BTreeMap::new();
@@ -249,6 +301,9 @@ impl ProviderKind {
         match self {
             Self::Codex => openai::prepare_exchange(session, exchange_id, body, artifact_refs),
             Self::Claude => anthropic::prepare_exchange(session, exchange_id, body, artifact_refs),
+            Self::Pi => {
+                panic!("Pi uses ProtocolKind::prepare_exchange for per-request dispatch")
+            }
         }
     }
 
@@ -263,8 +318,58 @@ impl ProviderKind {
                 "CLAUDE_API_BASE",
                 "CLAUDE_CODE_BASE_URL",
             ],
+            Self::Pi => &[
+                "OPENAI_BASE_URL",
+                "OPENAI_API_BASE",
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_API_URL",
+                "ANTHROPIC_API_BASE",
+            ],
         }
     }
+}
+
+impl ProtocolKind {
+    pub fn prepare_exchange(
+        self,
+        session: &SessionRuntime,
+        exchange_id: String,
+        body: &[u8],
+        artifact_refs: &ArtifactRefs,
+    ) -> PreparedExchange {
+        match self {
+            Self::OpenAi => openai::prepare_exchange(session, exchange_id, body, artifact_refs),
+            Self::Anthropic => {
+                anthropic::prepare_exchange(session, exchange_id, body, artifact_refs)
+            }
+        }
+    }
+
+    pub fn request_id_from_headers(
+        self,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Option<String> {
+        match self {
+            Self::OpenAi => ProviderKind::Codex.request_id_from_headers(headers),
+            Self::Anthropic => ProviderKind::Claude.request_id_from_headers(headers),
+        }
+    }
+}
+
+/// Resolve an upstream base URL from a list of environment variable names, falling back to a default.
+pub fn resolve_upstream_base_for_env(
+    env_names: &[&str],
+    default: &str,
+) -> Result<Url> {
+    let value = env_names
+        .iter()
+        .find_map(|name| env::var(name).ok().filter(|v| !v.trim().is_empty()));
+    Url::parse(value.as_deref().unwrap_or(default)).with_context(|| {
+        format!(
+            "failed to parse upstream URL from {}",
+            value.unwrap_or_else(|| default.to_string())
+        )
+    })
 }
 
 impl ExchangeState {
@@ -522,5 +627,88 @@ mod tests {
     fn claude_child_args_are_unchanged() {
         let args = vec!["--print".to_string(), "stream".to_string()];
         assert_eq!(ProviderKind::Claude.child_args(&args), args);
+    }
+
+    #[test]
+    fn pi_child_args_are_unchanged() {
+        let args = vec!["-p".to_string(), "hello".to_string()];
+        assert_eq!(ProviderKind::Pi.child_args(&args), args);
+    }
+
+    #[test]
+    fn pi_injected_env_sets_both_openai_and_anthropic_base_urls() {
+        let proxy = Url::parse("http://127.0.0.1:48123").unwrap();
+        let env_vars = ProviderKind::Pi.injected_env(&proxy);
+        let env_map: std::collections::BTreeMap<String, String> = env_vars.into_iter().collect();
+
+        assert_eq!(
+            env_map.get("OPENAI_BASE_URL").unwrap(),
+            "http://127.0.0.1:48123/openai/v1"
+        );
+        assert_eq!(
+            env_map.get("OPENAI_API_BASE").unwrap(),
+            "http://127.0.0.1:48123/openai/v1"
+        );
+        assert_eq!(
+            env_map.get("ANTHROPIC_BASE_URL").unwrap(),
+            "http://127.0.0.1:48123/anthropic"
+        );
+        assert_eq!(
+            env_map.get("ANTHROPIC_API_URL").unwrap(),
+            "http://127.0.0.1:48123/anthropic"
+        );
+        assert_eq!(
+            env_map.get("ANTHROPIC_API_BASE").unwrap(),
+            "http://127.0.0.1:48123/anthropic"
+        );
+    }
+
+    #[test]
+    fn pi_upstream_env_names_cover_both_providers() {
+        let names = ProviderKind::Pi.upstream_base_env_names();
+        assert!(names.contains(&"OPENAI_BASE_URL"));
+        assert!(names.contains(&"ANTHROPIC_BASE_URL"));
+    }
+
+    #[test]
+    fn pi_metadata_fields() {
+        assert_eq!(ProviderKind::Pi.command_name(), "pi");
+        assert_eq!(ProviderKind::Pi.provider_name(), "pi");
+        assert_eq!(ProviderKind::Pi.client_tag(), "cxtx/pi");
+        assert_eq!(
+            ProviderKind::Pi.labels(),
+            vec!["cxtx", "pi", "interactive"]
+        );
+    }
+
+    #[test]
+    fn pi_build_upstream_url_returns_error() {
+        let upstream = Url::parse("https://example.test").unwrap();
+        let uri: Uri = "/v1/messages".parse().unwrap();
+        assert!(ProviderKind::Pi.build_upstream_url(&upstream, &uri).is_err());
+    }
+
+    #[test]
+    fn pi_resolve_upstream_base_returns_error() {
+        assert!(ProviderKind::Pi.resolve_upstream_base().is_err());
+    }
+
+    #[test]
+    fn protocol_kind_request_id_delegates_correctly() {
+        use super::ProtocolKind;
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-request-id", "req_openai".parse().unwrap());
+        assert_eq!(
+            ProtocolKind::OpenAi.request_id_from_headers(&headers),
+            Some("req_openai".to_string())
+        );
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("request-id", "req_anthropic".parse().unwrap());
+        assert_eq!(
+            ProtocolKind::Anthropic.request_id_from_headers(&headers),
+            Some("req_anthropic".to_string())
+        );
     }
 }

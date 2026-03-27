@@ -41,6 +41,11 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Launch the `pi` coding agent through a local dual-protocol capture proxy.
+    Pi {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 impl Command {
@@ -48,12 +53,13 @@ impl Command {
         match self {
             Self::Claude { .. } => ProviderKind::Claude,
             Self::Codex { .. } => ProviderKind::Codex,
+            Self::Pi { .. } => ProviderKind::Pi,
         }
     }
 
     pub fn args(&self) -> &[String] {
         match self {
-            Self::Claude { args } | Self::Codex { args } => args,
+            Self::Claude { args } | Self::Codex { args } | Self::Pi { args } => args,
         }
     }
 }
@@ -71,6 +77,7 @@ impl Cli {
         let command = match provider {
             ProviderKind::Claude => Command::Claude { args },
             ProviderKind::Codex => Command::Codex { args },
+            ProviderKind::Pi => Command::Pi { args },
         };
         Self {
             url: url.to_string(),
