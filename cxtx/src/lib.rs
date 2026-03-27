@@ -59,7 +59,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
         .context("failed to reserve local reverse proxy listener")?;
     let args = provider.child_args_for_proxy(cli.command.args(), Some(&proxy_base_url));
     let allowlisted_env = provider.capture_env_allowlist();
-    let session = SessionRuntime::new(provider, args.clone(), allowlisted_env)?;
+    let session = SessionRuntime::new(provider, args.clone(), allowlisted_env, &cli.labels)?;
     let ledger = SessionLedgerWriter::create(&session).await?;
 
     let proxy = ProxyServer::start_with_listener(

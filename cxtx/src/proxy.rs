@@ -1215,7 +1215,7 @@ mod tests {
         });
 
         let session =
-            SessionRuntime::new(ProviderKind::Codex, Vec::new(), BTreeMap::new()).unwrap();
+            SessionRuntime::new(ProviderKind::Codex, Vec::new(), BTreeMap::new(), &[]).unwrap();
         let ledger = SessionLedgerWriter::create(&session).await.unwrap();
         let proxy = ProxyServer::start(
             ProviderKind::Codex,
@@ -1260,7 +1260,7 @@ mod tests {
     #[test]
     fn websocket_capture_turns_real_prompt_into_history_and_answer() {
         let session =
-            SessionRuntime::new(ProviderKind::Codex, Vec::new(), BTreeMap::new()).unwrap();
+            SessionRuntime::new(ProviderKind::Codex, Vec::new(), BTreeMap::new(), &[]).unwrap();
         let mut capture = WebsocketCapture::new(
             ProviderKind::Codex,
             "exchange-0001".to_string(),
@@ -1352,7 +1352,7 @@ mod tests {
         use crate::provider::ProtocolKind;
 
         let session =
-            SessionRuntime::new(ProviderKind::Pi, Vec::new(), BTreeMap::new()).unwrap();
+            SessionRuntime::new(ProviderKind::Pi, Vec::new(), BTreeMap::new(), &[]).unwrap();
         let state = ProxyState {
             provider: ProviderKind::Pi,
             upstream: UpstreamConfig::DualProtocol {
@@ -1381,7 +1381,7 @@ mod tests {
         use crate::provider::ProtocolKind;
 
         let session =
-            SessionRuntime::new(ProviderKind::Pi, Vec::new(), BTreeMap::new()).unwrap();
+            SessionRuntime::new(ProviderKind::Pi, Vec::new(), BTreeMap::new(), &[]).unwrap();
         let state = ProxyState {
             provider: ProviderKind::Pi,
             upstream: UpstreamConfig::DualProtocol {
@@ -1406,7 +1406,7 @@ mod tests {
     #[tokio::test]
     async fn dual_protocol_rejects_unknown_prefix() {
         let session =
-            SessionRuntime::new(ProviderKind::Pi, Vec::new(), BTreeMap::new()).unwrap();
+            SessionRuntime::new(ProviderKind::Pi, Vec::new(), BTreeMap::new(), &[]).unwrap();
         let state = ProxyState {
             provider: ProviderKind::Pi,
             upstream: UpstreamConfig::DualProtocol {
@@ -1428,7 +1428,7 @@ mod tests {
         use crate::provider::ProtocolKind;
 
         let session =
-            SessionRuntime::new(ProviderKind::Codex, Vec::new(), BTreeMap::new()).unwrap();
+            SessionRuntime::new(ProviderKind::Codex, Vec::new(), BTreeMap::new(), &[]).unwrap();
         let state = ProxyState {
             provider: ProviderKind::Codex,
             upstream: UpstreamConfig::Single {

@@ -77,6 +77,7 @@ pub fn context_metadata(
     provider: ProviderKind,
     session: &CapturedSession,
     allowlisted_env: &BTreeMap<String, String>,
+    extra_labels: &[String],
 ) -> ContextMetadata {
     let mut custom = HashMap::new();
     custom.insert("stable_session_id".to_string(), session.session_id.clone());
@@ -109,7 +110,11 @@ pub fn context_metadata(
             session.child_command,
             session.started_at.format("%Y-%m-%dT%H:%M:%SZ")
         ),
-        labels: provider.labels(),
+        labels: {
+            let mut labels = provider.labels();
+            labels.extend(extra_labels.iter().cloned());
+            labels
+        },
         custom,
         provenance: None,
     };

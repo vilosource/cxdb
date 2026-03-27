@@ -25,6 +25,13 @@ pub struct Cli {
     )]
     pub local: bool,
 
+    #[arg(
+        long = "label",
+        help = "Extra labels to attach to the CXDB context (repeatable)",
+        value_name = "LABEL"
+    )]
+    pub labels: Vec<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -82,6 +89,7 @@ impl Cli {
         Self {
             url: url.to_string(),
             local: false,
+            labels: Vec::new(),
             command,
         }
     }
@@ -113,5 +121,24 @@ mod tests {
         let result =
             Cli::try_parse_from(["cxtx", "--local", "--url", "http://example.test", "codex"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn label_flag_collects_multiple_labels() {
+        let cli = Cli::parse_from([
+            "cxtx",
+            "--label",
+            "task:abc123",
+            "--label",
+            "env:dev",
+            "claude",
+        ]);
+        assert_eq!(cli.labels, vec!["task:abc123", "env:dev"]);
+    }
+
+    #[test]
+    fn no_labels_by_default() {
+        let cli = Cli::parse_from(["cxtx", "codex"]);
+        assert!(cli.labels.is_empty());
     }
 }

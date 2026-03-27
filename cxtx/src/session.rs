@@ -65,6 +65,7 @@ impl SessionRuntime {
         provider: ProviderKind,
         child_args: Vec<String>,
         allowlisted_env: BTreeMap<String, String>,
+        extra_labels: &[String],
     ) -> Result<Self> {
         let started_at = Utc::now();
         let session = CapturedSession {
@@ -74,7 +75,7 @@ impl SessionRuntime {
             child_args,
             started_at,
         };
-        let metadata = context_metadata(provider, &session, &allowlisted_env);
+        let metadata = context_metadata(provider, &session, &allowlisted_env, extra_labels);
         Ok(Self {
             inner: Arc::new(SessionRuntimeInner {
                 session,
@@ -336,6 +337,7 @@ mod tests {
             ProviderKind::Codex,
             vec!["--help".to_string()],
             BTreeMap::new(),
+            &[],
         )
         .unwrap();
         let turn = session.session_start_turn();
@@ -348,7 +350,7 @@ mod tests {
     #[test]
     fn rewrite_detection_emits_system_turn_before_new_suffix() {
         let session =
-            SessionRuntime::new(ProviderKind::Codex, Vec::new(), BTreeMap::new()).unwrap();
+            SessionRuntime::new(ProviderKind::Codex, Vec::new(), BTreeMap::new(), &[]).unwrap();
         let first = session.observe_request_history(
             "exchange-0001",
             vec![HistoryItem::UserInput {
@@ -377,7 +379,7 @@ mod tests {
     #[test]
     fn assistant_turn_dedup_ignores_model_and_finish_reason() {
         let session =
-            SessionRuntime::new(ProviderKind::Claude, Vec::new(), BTreeMap::new()).unwrap();
+            SessionRuntime::new(ProviderKind::Claude, Vec::new(), BTreeMap::new(), &[]).unwrap();
         let first = session.observe_request_history(
             "exchange-0001",
             vec![HistoryItem::UserInput {
@@ -431,5 +433,22 @@ mod tests {
 
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].item.item_type, "tool_result");
+    }
+
+    #[test]
+    fn extra_labels_appear_in_context_metadata() {
+        let session = SessionRuntime::new(
+            ProviderKind::Codex,
+            vec!["--help".to_string()],
+            BTreeMap::new(),
+            &["task:abc123".to_string(), "env:dev".to_string()],
+        )
+        .unwrap();
+        let turn = session.session_start_turn();
+        let labels = &turn.item.context_metadata.as_ref().unwrap().labels;
+        assert!(labels.contains(&"cxtx".to_string()));
+        assert!(labels.contains(&"codex".to_string()));
+        assert!(labels.contains(&"task:abc123".to_string()));
+        assert!(labels.contains(&"env:dev".to_string()));
     }
 }

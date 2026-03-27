@@ -45,6 +45,7 @@ async fn first_record_metadata_is_queryable_via_cxdb_http() {
         ProviderKind::Codex,
         vec!["--help".to_string()],
         BTreeMap::new(),
+        &[],
     )
     .unwrap();
     let client =
@@ -87,6 +88,7 @@ async fn registry_bundle_is_published_before_first_append() {
         ProviderKind::Codex,
         vec!["--help".to_string()],
         BTreeMap::new(),
+        &[],
     )
     .unwrap();
     let client =
@@ -526,6 +528,7 @@ async fn websocket_proxy_uploads_canonical_turns_into_cxdb() {
         ProviderKind::Codex,
         vec!["interactive".to_string()],
         BTreeMap::new(),
+        &[],
     )
     .unwrap();
     let ledger = SessionLedgerWriter::create(&session).await.unwrap();
@@ -1181,6 +1184,7 @@ async fn queued_delivery_recovers_when_cxdb_appears_later() {
         ProviderKind::Codex,
         vec!["--help".to_string()],
         BTreeMap::new(),
+        &[],
     )
     .unwrap();
     let ledger = SessionLedgerWriter::create(&session).await.unwrap();
@@ -1226,6 +1230,7 @@ async fn queued_delivery_recovers_from_mid_session_append_failure_in_order() {
         ProviderKind::Codex,
         vec!["--help".to_string()],
         BTreeMap::new(),
+        &[],
     )
     .unwrap();
     let ledger = SessionLedgerWriter::create(&session).await.unwrap();
@@ -1279,6 +1284,7 @@ async fn shutdown_drain_records_remaining_queue_state() {
         ProviderKind::Codex,
         vec!["--help".to_string()],
         BTreeMap::new(),
+        &[],
     )
     .unwrap();
     let ledger = SessionLedgerWriter::create(&session).await.unwrap();
