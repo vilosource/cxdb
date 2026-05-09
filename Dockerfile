@@ -6,7 +6,10 @@
 # ============================================
 # Stage 1: Build frontend
 # ============================================
-FROM node:20-alpine AS frontend
+# Node 22+ required: corepack-activated pnpm 11 imports `node:sqlite` (added in
+# Node 22). Building on node:20-alpine fails the install step with
+# `ERR_UNKNOWN_BUILTIN_MODULE: No such built-in module: node:sqlite`.
+FROM node:22-alpine AS frontend
 
 WORKDIR /app
 
