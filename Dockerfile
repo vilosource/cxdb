@@ -13,8 +13,11 @@ FROM node:22-alpine AS frontend
 
 WORKDIR /app
 
-# Install pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# Install pnpm. Pin to v10: pnpm 11 introduced a default-deny on package
+# build scripts (`[ERR_PNPM_IGNORED_BUILDS]`), so unrs-resolver's native
+# binding never builds and the subsequent `pnpm build` fails. v10 keeps the
+# old "run scripts" behavior and supports Node 22.
+RUN corepack enable && corepack prepare pnpm@10 --activate
 
 # Copy package files
 COPY frontend/package.json frontend/pnpm-lock.yaml* ./
