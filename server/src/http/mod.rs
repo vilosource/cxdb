@@ -208,6 +208,15 @@ fn handle_request(
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(20);
                 let tag_filter = params.get("tag").cloned();
+                // vafi#38: honor task_id by routing through the label index.
+                // The convention is `task:<id>` (set by every cxdb client when
+                // it creates a per-task context). An explicit `label=` param
+                // is also accepted for callers that need to filter by a label
+                // whose format isn't `task:...`.
+                let task_id_filter = params.get("task_id");
+                let label_filter = params.get("label").cloned().or_else(|| {
+                    task_id_filter.map(|id| format!("task:{id}"))
+                });
                 let include_provenance = params
                     .get("include_provenance")
                     .map(|v| v == "1")
@@ -218,7 +227,10 @@ fn handle_request(
                     .unwrap_or(false);
 
                 let store = store.read().unwrap();
-                let contexts = store.list_recent_contexts(limit);
+                let contexts = match label_filter.as_deref() {
+                    Some(label) => store.list_contexts_by_label(label, limit),
+                    None => store.list_recent_contexts(limit),
+                };
 
                 let contexts_json: Vec<JsonValue> = contexts
                     .iter()
