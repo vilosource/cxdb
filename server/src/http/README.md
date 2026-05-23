@@ -10,7 +10,10 @@ The HTTP module provides a REST-ish JSON API for reading turns, managing context
 
 ### Contexts
 
-- `GET /v1/contexts` - List contexts
+- `GET /v1/contexts` - List contexts. Query params: `limit`, `tag`,
+  `task_id` (filters to contexts whose labels include `task:<id>`),
+  `label` (raw label filter; takes precedence over `task_id`),
+  `include_provenance`, `include_lineage`.
 - `GET /v1/contexts/:id` - Get context details
 - `GET /v1/contexts/:id/children` - Get direct/recursive child contexts
 - `GET /v1/contexts/:id/provenance` - Get provenance block

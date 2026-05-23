@@ -157,6 +157,93 @@ fn indexes_parent_child_context_lineage() {
     assert_eq!(descendants, vec![grandchild.context_id, child.context_id]);
 }
 
+/// vafi#38 — `list_contexts_by_label` must return only contexts whose
+/// labels include the exact filter string, ordered by recency, truncated
+/// to `limit`. Closes the bug where `GET /v1/contexts?task_id=X` silently
+/// returned the global most-recent list because the handler never consulted
+/// the label index.
+#[test]
+fn list_contexts_by_label_filters_by_exact_label() {
+    let dir = tempdir().expect("tempdir");
+    let mut store = Store::open(dir.path()).expect("open store");
+
+    let ctx_a1 = store.create_context(0).expect("create A1");
+    let ctx_b = store.create_context(0).expect("create B");
+    let ctx_a2 = store.create_context(0).expect("create A2");
+    let ctx_unlabeled = store.create_context(0).expect("create unlabeled");
+
+    // Two contexts labeled task:A, one labeled task:B, one with no labels.
+    // ctx_a2 is created last → has the higher created_at_unix_ms, so it
+    // should sort first.
+    append_first_turn_with_labels(&mut store, ctx_a1.context_id, &["task:A"]);
+    append_first_turn_with_labels(&mut store, ctx_b.context_id, &["task:B"]);
+    append_first_turn_with_labels(&mut store, ctx_a2.context_id, &["task:A"]);
+    // unlabeled context: append a turn with no labels at all.
+    append_first_turn_with_labels(&mut store, ctx_unlabeled.context_id, &[]);
+
+    let task_a = store.list_contexts_by_label("task:A", 50);
+    let ids: Vec<u64> = task_a.iter().map(|h| h.context_id).collect();
+    assert_eq!(
+        ids,
+        vec![ctx_a2.context_id, ctx_a1.context_id],
+        "task:A filter must return only the two task:A contexts, newest first"
+    );
+
+    let task_b = store.list_contexts_by_label("task:B", 50);
+    let ids: Vec<u64> = task_b.iter().map(|h| h.context_id).collect();
+    assert_eq!(ids, vec![ctx_b.context_id]);
+
+    // No match → empty.
+    let none = store.list_contexts_by_label("task:DOES-NOT-EXIST", 50);
+    assert!(none.is_empty());
+
+    // Limit truncates after sort.
+    let limited = store.list_contexts_by_label("task:A", 1);
+    let ids: Vec<u64> = limited.iter().map(|h| h.context_id).collect();
+    assert_eq!(ids, vec![ctx_a2.context_id]);
+}
+
+fn append_first_turn_with_labels(
+    store: &mut Store,
+    context_id: u64,
+    labels: &[&str],
+) {
+    let payload = encode_context_metadata_with_labels(labels);
+    let hash = blake3::hash(&payload);
+    store
+        .append_turn(
+            context_id,
+            0,
+            "cxdb.ConversationItem".to_string(),
+            1,
+            1,
+            0,
+            payload.len() as u32,
+            *hash.as_bytes(),
+            &payload,
+        )
+        .expect("append labeled first turn");
+}
+
+fn encode_context_metadata_with_labels(labels: &[&str]) -> Vec<u8> {
+    // Wire format per server/src/store.rs extract_context_metadata:
+    //   root: Map { 30 -> context_metadata }
+    //   context_metadata: Map { 1 -> client_tag, 3 -> [labels...] }
+    let label_values: Vec<Value> = labels.iter().map(|s| Value::from(*s)).collect();
+    let mut meta_entries: Vec<(Value, Value)> = vec![
+        (Value::from(1), Value::from("test-client")),
+    ];
+    if !labels.is_empty() {
+        meta_entries.push((Value::from(3), Value::Array(label_values)));
+    }
+    let context_metadata = Value::Map(meta_entries);
+    let root = Value::Map(vec![(Value::from(30), context_metadata)]);
+
+    let mut payload = Vec::new();
+    rmpv::encode::write_value(&mut payload, &root).expect("encode payload");
+    payload
+}
+
 fn encode_context_metadata_payload(
     parent_context_id: Option<u64>,
     root_context_id: Option<u64>,

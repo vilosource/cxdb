@@ -318,6 +318,23 @@ impl Store {
         self.turn_store.list_recent_contexts(limit)
     }
 
+    /// Return contexts whose `labels` array contains the given exact value,
+    /// ordered by `created_at_unix_ms` descending and truncated to `limit`.
+    ///
+    /// Closes vafi#38: the previous `GET /v1/contexts?task_id=X` handler
+    /// ignored the filter and returned the global recent list. The label
+    /// index has always known the answer; this method exposes it.
+    pub fn list_contexts_by_label(&self, label: &str, limit: u32) -> Vec<ContextHead> {
+        let matching_ids = self.secondary_indexes.lookup_label_exact(label);
+        let mut heads: Vec<ContextHead> = matching_ids
+            .into_iter()
+            .filter_map(|id| self.turn_store.get_head(id).ok())
+            .collect();
+        heads.sort_by(|a, b| b.created_at_unix_ms.cmp(&a.created_at_unix_ms));
+        heads.truncate(limit as usize);
+        heads
+    }
+
     /// Return direct child context IDs for a parent context.
     ///
     /// Child relationships are derived from first-turn provenance
